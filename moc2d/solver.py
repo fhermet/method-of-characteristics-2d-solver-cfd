@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 
 from moc2d.config import SimulationConfig
 from moc2d.gas import prandtl_meyer, pressure_ratio, temperature_ratio
-from moc2d.geometry import find_compressive_corners, wall_y_at
+import math
+
+from moc2d.gas import inverse_prandtl_meyer, mach_angle
+from moc2d.geometry import find_compressive_corners, find_expansion_corners, wall_y_at
 from moc2d.characteristics import CharPoint, interior_point, wall_point, axis_point
 from moc2d.shocks import ShockPoint, create_shock, propagate_shock
 
@@ -86,11 +89,17 @@ def solve(config: SimulationConfig) -> SolverResult:
 
     corners_lower = find_compressive_corners(lower_wall) if lower_wall else []
     corners_upper = find_compressive_corners(upper_wall) if upper_wall else []
+    exp_corners_lower = find_expansion_corners(lower_wall) if lower_wall else []
+    exp_corners_upper = find_expansion_corners(upper_wall) if upper_wall else []
     processed_corners: set[tuple[float, float]] = set()
 
     result = SolverResult(config=config)
 
     current_layer = _init_inlet(config)
+    y_values_inlet = [wall.points[0].y for wall in config.walls]
+    y_min_inlet = min(y_values_inlet)
+    y_max_inlet = max(y_values_inlet)
+
     # Store indices of current layer points in result.char_points
     layer_indices: list[int] = []
     for pt in current_layer:
@@ -275,6 +284,83 @@ def solve(config: SimulationConfig) -> SolverResult:
                         shock_idx_trackers.append([shock_idx])
                     except (ValueError, ZeroDivisionError):
                         pass
+
+        # Detect and generate Prandtl-Meyer expansion fans at expansion corners
+        for exp_corners, is_lower_wall in [
+            (exp_corners_lower, True),
+            (exp_corners_upper, False),
+        ]:
+            for cx, cy, d_theta in exp_corners:
+                key = ("exp", cx, cy)
+                if key in processed_corners:
+                    continue
+                if avg_x >= cx:
+                    processed_corners.add(key)
+                    # Find the upstream state at the corner
+                    closest = min(
+                        current_layer,
+                        key=lambda pt: (pt.x - cx)**2 + (pt.y - cy)**2,
+                    )
+                    M_up = closest.mach
+                    theta_up = closest.theta
+                    nu_up = closest.nu
+
+                    # Generate n_fan points along the Prandtl-Meyer fan.
+                    # Each fan ray is a C+ characteristic (for lower wall) or C-
+                    # (for upper wall) emanating from the corner at a specific angle.
+                    # Place each point at a small distance ds along its ray.
+                    n_fan = max(10, config.n_char_lines // 2)
+                    # ds scales with the domain height for proper spacing
+                    ds = (y_max_inlet - y_min_inlet) / n_fan * 0.8
+
+                    for j in range(n_fan):
+                        frac = (j + 1) / (n_fan + 1)
+                        delta = frac * d_theta
+                        if is_lower_wall:
+                            theta_fan = theta_up - delta
+                        else:
+                            theta_fan = theta_up + delta
+                        nu_fan = nu_up + delta
+                        M_fan = inverse_prandtl_meyer(float(nu_fan), gas.gamma)
+                        if M_fan < 1.0:
+                            continue
+                        mu_fan = float(mach_angle(M_fan))
+                        p_fan = p0 * float(pressure_ratio(M_fan, gas.gamma))
+                        T_fan = T0 * float(temperature_ratio(M_fan, gas.gamma))
+
+                        # Place point along the fan ray (C+ for lower wall, C- for upper)
+                        if is_lower_wall:
+                            ray_angle = theta_fan + mu_fan  # C+ goes upward from lower corner
+                        else:
+                            ray_angle = theta_fan - mu_fan  # C- goes downward from upper corner
+                        x_fan = cx + ds * (j + 1) * math.cos(ray_angle)
+                        y_fan = cy + ds * (j + 1) * math.sin(ray_angle)
+
+                        fan_pt = CharPoint(
+                            x=x_fan, y=y_fan, mach=M_fan, theta=float(theta_fan),
+                            nu=float(nu_fan), p=p_fan, T=T_fan, kind="interior",
+                        )
+                        idx = len(result.char_points)
+                        result.char_points.append(fan_pt)
+
+                        if is_lower_wall:
+                            new_layer.append(fan_pt)
+                            new_indices.append(idx)
+                            new_cm_fam = len(cm_families)
+                            cm_families.append([idx])
+                            new_cm_family_of.append(new_cm_fam)
+                            new_cp_fam = len(cp_families)
+                            cp_families.append([idx])
+                            new_cp_family_of.append(new_cp_fam)
+                        else:
+                            new_layer.insert(0, fan_pt)
+                            new_indices.insert(0, idx)
+                            new_cm_fam = len(cm_families)
+                            cm_families.append([idx])
+                            new_cm_family_of.insert(0, new_cm_fam)
+                            new_cp_fam = len(cp_families)
+                            cp_families.append([idx])
+                            new_cp_family_of.insert(0, new_cp_fam)
 
         # Propagate active shocks forward one step
         for i, shock_line in enumerate(active_shocks):

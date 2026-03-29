@@ -93,3 +93,30 @@ def find_compressive_corners(wall: WallDefinition) -> list[tuple[float, float, f
         elif not is_lower and delta < -1e-8:
             corners.append((float(xs[i]), float(ys[i]), float(abs(delta))))
     return corners
+
+
+def find_expansion_corners(wall: WallDefinition) -> list[tuple[float, float, float]]:
+    """Detect expansion corners on a wall (for Prandtl-Meyer fan generation).
+
+    An expansion corner is where the wall turns AWAY from the flow.
+    Returns list of (x, y, delta_theta) where delta_theta > 0 is the expansion angle.
+    """
+    if wall.interpolation == "cubic":
+        return []
+    xs, ys = _get_xy(wall)
+    corners = []
+    is_lower = wall.name in ("lower", "axis")
+    for i in range(1, len(xs) - 1):
+        dx_before = xs[i] - xs[i - 1]
+        dy_before = ys[i] - ys[i - 1]
+        dx_after = xs[i + 1] - xs[i]
+        dy_after = ys[i + 1] - ys[i]
+        angle_before = math.atan2(dy_before, dx_before) if abs(dx_before) > 1e-15 else 0.0
+        angle_after = math.atan2(dy_after, dx_after) if abs(dx_after) > 1e-15 else 0.0
+        delta = angle_after - angle_before
+        # Expansion: lower wall turns downward (delta < 0), upper wall turns upward (delta > 0)
+        if is_lower and delta < -1e-8:
+            corners.append((float(xs[i]), float(ys[i]), float(abs(delta))))
+        elif not is_lower and delta > 1e-8:
+            corners.append((float(xs[i]), float(ys[i]), float(delta)))
+    return corners
