@@ -130,10 +130,12 @@ def wall_point(
     mu1 = float(mach_angle(p1.mach))
 
     if side == "upper":
-        slope = math.tan(p1.theta - mu1)
+        # C+ (left-running) goes upward to the upper wall: slope = tan(theta + mu)
+        slope = math.tan(p1.theta + mu1)
         K = p1.theta - p1.nu  # K- along C+
     else:
-        slope = math.tan(p1.theta + mu1)
+        # C- (right-running) goes downward to the lower wall: slope = tan(theta - mu)
+        slope = math.tan(p1.theta - mu1)
         K = p1.theta + p1.nu  # K+ along C-
 
     x_w = p1.x + 0.5
@@ -150,9 +152,9 @@ def wall_point(
             M_w = inverse_prandtl_meyer(nu_w, gas.gamma)
             mu_w = float(mach_angle(M_w))
             if side == "upper":
-                avg_slope = math.tan((p1.theta + theta_w) / 2 - (mu1 + mu_w) / 2)
-            else:
                 avg_slope = math.tan((p1.theta + theta_w) / 2 + (mu1 + mu_w) / 2)
+            else:
+                avg_slope = math.tan((p1.theta + theta_w) / 2 - (mu1 + mu_w) / 2)
             if abs(avg_slope) > 1e-15:
                 x_w = p1.x + (wall_y_at(wall, x_w) - p1.y) / avg_slope
                 slope = avg_slope
