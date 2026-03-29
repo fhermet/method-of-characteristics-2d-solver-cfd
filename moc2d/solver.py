@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from moc2d.config import SimulationConfig
 from moc2d.gas import prandtl_meyer, pressure_ratio, temperature_ratio
-from moc2d.geometry import find_compressive_corners
+from moc2d.geometry import find_compressive_corners, wall_y_at
 from moc2d.characteristics import CharPoint, interior_point, wall_point, axis_point
 from moc2d.shocks import ShockPoint, create_shock, propagate_shock
 
@@ -136,6 +136,31 @@ def solve(config: SimulationConfig) -> SolverResult:
                     continue
                 if p3.mach < 1.0:
                     continue
+
+                # Boundary condition check: if point is outside the domain,
+                # replace it with a wall point (proper BC, not clamping).
+                y_upper = wall_y_at(upper_wall, p3.x) if upper_wall else 1e10
+                y_lower = wall_y_at(lower_wall, p3.x) if lower_wall else -1e10
+
+                if p3.y > y_upper and upper_wall:
+                    # C+ from p2 has reached the upper wall — compute wall point
+                    p3 = wall_point(p2, upper_wall, gas, geom_type, "upper", p0, T0)
+                    if p3.x <= min(p1.x, p2.x) or p3.mach < 1.0:
+                        continue
+                    p3 = CharPoint(
+                        x=p3.x, y=p3.y, mach=p3.mach, theta=p3.theta,
+                        nu=p3.nu, p=p3.p, T=p3.T, kind="wall",
+                    )
+                elif p3.y < y_lower and lower_wall:
+                    # C- from p1 has reached the lower wall — compute wall point
+                    p3 = wall_point(p1, lower_wall, gas, geom_type, "lower", p0, T0)
+                    if p3.x <= min(p1.x, p2.x) or p3.mach < 1.0:
+                        continue
+                    p3 = CharPoint(
+                        x=p3.x, y=p3.y, mach=p3.mach, theta=p3.theta,
+                        nu=p3.nu, p=p3.p, T=p3.T, kind="wall",
+                    )
+
                 idx = len(result.char_points)
                 result.char_points.append(p3)
                 new_layer.append(p3)
