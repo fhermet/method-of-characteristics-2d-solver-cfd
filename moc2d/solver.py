@@ -61,42 +61,19 @@ def _find_upper_lower_walls(config: SimulationConfig):
     return upper, lower
 
 
-def _build_lines(edges: list[tuple[int, int]]) -> list[list[int]]:
-    """Build connected lines from a list of (from, to) edge pairs."""
-    if not edges:
-        return []
-    # Build adjacency: for each node, what comes next
-    next_node: dict[int, int] = {}
-    has_predecessor: set[int] = set()
-    for a, b in edges:
-        next_node[a] = b
-        has_predecessor.add(b)
-
-    # Find line starts (nodes with no predecessor in this edge set)
-    starts = [a for a, _ in edges if a not in has_predecessor]
-    # Fallback: if all nodes have predecessors (cycle), just use first edge start
-    if not starts and edges:
-        starts = [edges[0][0]]
-
-    visited: set[int] = set()
-    lines = []
-    for s in starts:
-        if s in visited:
-            continue
-        line = [s]
-        visited.add(s)
-        node = s
-        while node in next_node and next_node[node] not in visited:
-            node = next_node[node]
-            line.append(node)
-            visited.add(node)
-        if len(line) > 1:
-            lines.append(line)
-    return lines
-
-
 def solve(config: SimulationConfig) -> SolverResult:
-    """Run the MOC 2D solver with x-marching."""
+    """Run the MOC 2D solver with x-marching.
+
+    Connectivity tracking uses per-family lists:
+    - cm_families[j] tracks the C- line emanating from inlet point j (going downward)
+    - cp_families[j] tracks the C+ line emanating from inlet point j (going upward)
+
+    Convention: points in a layer are ordered high-y to low-y.
+    For pair (i, i+1): p_i is upper (on C-), p_{i+1} is lower (on C+).
+    The interior point between them is on:
+      - C- family of p_i (C- continues downward from the upper point)
+      - C+ family of p_{i+1} (C+ continues upward from the lower point)
+    """
     t_start = time.perf_counter()
 
     gas = config.gas
@@ -113,16 +90,23 @@ def solve(config: SimulationConfig) -> SolverResult:
 
     result = SolverResult(config=config)
 
-    # Edge lists for connectivity: (from_idx, to_idx)
-    cp_edges: list[tuple[int, int]] = []  # C+ line edges
-    cm_edges: list[tuple[int, int]] = []  # C- line edges
-
     current_layer = _init_inlet(config)
     # Store indices of current layer points in result.char_points
     layer_indices: list[int] = []
     for pt in current_layer:
         layer_indices.append(len(result.char_points))
         result.char_points.append(pt)
+
+    n = len(current_layer)
+
+    # Per-family line tracking.
+    # cm_family_of[j] = index into cm_families for the C- line passing through layer point j
+    # cp_family_of[j] = index into cp_families for the C+ line passing through layer point j
+    # At the inlet, each point starts its own C- and C+ family.
+    cm_families: list[list[int]] = [[layer_indices[j]] for j in range(n)]
+    cp_families: list[list[int]] = [[layer_indices[j]] for j in range(n)]
+    cm_family_of: list[int] = list(range(n))  # point j is on C- family j
+    cp_family_of: list[int] = list(range(n))  # point j is on C+ family j
 
     active_shocks: list[list[ShockPoint]] = []
     shock_idx_trackers: list[list[int]] = []
@@ -139,8 +123,10 @@ def solve(config: SimulationConfig) -> SolverResult:
 
         new_layer: list[CharPoint] = []
         new_indices: list[int] = []
+        new_cm_family_of: list[int] = []
+        new_cp_family_of: list[int] = []
 
-        # Interior points — p1 is upper (on C-), p2 is lower (on C+)
+        # Interior points — p1=layer[i] is upper (on C-), p2=layer[i+1] is lower (on C+)
         for i in range(len(current_layer) - 1):
             p1 = current_layer[i]
             p2 = current_layer[i + 1]
@@ -155,50 +141,91 @@ def solve(config: SimulationConfig) -> SolverResult:
                 new_layer.append(p3)
                 new_indices.append(idx)
 
-                # C+ connects p1 (upper) to p3 (C+ goes from lower-left to upper-right,
-                # but in layer progression it connects the upper source to the new point)
-                cp_edges.append((layer_indices[i], idx))
-                # C- connects p2 (lower) to p3
-                cm_edges.append((layer_indices[i + 1], idx))
+                # C- from p1 (upper) continues through p3
+                cm_fam = cm_family_of[i]
+                cm_families[cm_fam].append(idx)
+                new_cm_family_of.append(cm_fam)
+
+                # C+ from p2 (lower) continues through p3
+                cp_fam = cp_family_of[i + 1]
+                cp_families[cp_fam].append(idx)
+                new_cp_family_of.append(cp_fam)
+
             except (ValueError, ZeroDivisionError, RuntimeError):
                 continue
 
-        # Upper wall point
+        # Upper wall point — C+ from topmost interior reaches the wall
         if upper_wall and new_layer:
             try:
                 pw = wall_point(new_layer[0], upper_wall, gas, geom_type, "upper", p0, T0)
-                if pw.x > current_layer[0].x and pw.mach >= 1.0:
+                if pw.x > min(p.x for p in current_layer) and pw.mach >= 1.0:
                     idx = len(result.char_points)
                     result.char_points.append(pw)
                     new_layer.insert(0, pw)
                     new_indices.insert(0, idx)
-                    # C+ connects topmost interior point to wall
-                    cp_edges.append((new_indices[1], idx))
+
+                    # The C+ line from the topmost interior terminates at the wall
+                    cp_fam = new_cp_family_of[0] if new_cp_family_of else -1
+                    if cp_fam >= 0:
+                        cp_families[cp_fam].append(idx)
+
+                    # Start a NEW C- family from the wall reflection
+                    new_cm_fam = len(cm_families)
+                    cm_families.append([idx])
+                    new_cm_family_of.insert(0, new_cm_fam)
+
+                    # The wall point starts a new C+ family (for tracking)
+                    new_cp_fam = len(cp_families)
+                    cp_families.append([idx])
+                    new_cp_family_of.insert(0, new_cp_fam)
             except (ValueError, ZeroDivisionError, RuntimeError):
                 pass
 
-        # Lower wall point or axis point
+        # Lower wall point or axis point — C- from bottommost interior reaches the wall
         if lower_wall and new_layer:
             if geom_type.kind == "axisymmetric" and lower_wall.name == "axis":
                 try:
                     pa = axis_point(new_layer[-1], gas, p0, T0)
-                    if pa.x > current_layer[-1].x and pa.mach >= 1.0:
+                    if pa.x > min(p.x for p in current_layer) and pa.mach >= 1.0:
                         idx = len(result.char_points)
                         result.char_points.append(pa)
                         new_layer.append(pa)
                         new_indices.append(idx)
-                        cm_edges.append((new_indices[-2], idx))
+
+                        cm_fam = new_cm_family_of[-1] if new_cm_family_of else -1
+                        if cm_fam >= 0:
+                            cm_families[cm_fam].append(idx)
+                        new_cp_fam = len(cp_families)
+                        cp_families.append([idx])
+                        new_cp_family_of.append(new_cp_fam)
+                        new_cm_fam = len(cm_families)
+                        cm_families.append([idx])
+                        new_cm_family_of.append(new_cm_fam)
                 except (ValueError, ZeroDivisionError, RuntimeError):
                     pass
             else:
                 try:
                     pw = wall_point(new_layer[-1], lower_wall, gas, geom_type, "lower", p0, T0)
-                    if pw.x > current_layer[-1].x and pw.mach >= 1.0:
+                    if pw.x > min(p.x for p in current_layer) and pw.mach >= 1.0:
                         idx = len(result.char_points)
                         result.char_points.append(pw)
                         new_layer.append(pw)
                         new_indices.append(idx)
-                        cm_edges.append((new_indices[-2], idx))
+
+                        # C- from bottommost interior terminates at wall
+                        cm_fam = new_cm_family_of[-1] if new_cm_family_of else -1
+                        if cm_fam >= 0:
+                            cm_families[cm_fam].append(idx)
+
+                        # Start new C+ family from wall reflection
+                        new_cp_fam = len(cp_families)
+                        cp_families.append([idx])
+                        new_cp_family_of.append(new_cp_fam)
+
+                        # Start new C- family
+                        new_cm_fam = len(cm_families)
+                        cm_families.append([idx])
+                        new_cm_family_of.append(new_cm_fam)
                 except (ValueError, ZeroDivisionError, RuntimeError):
                     pass
 
@@ -247,10 +274,12 @@ def solve(config: SimulationConfig) -> SolverResult:
 
         current_layer = new_layer
         layer_indices = new_indices
+        cm_family_of = new_cm_family_of
+        cp_family_of = new_cp_family_of
 
-    # Build characteristic lines from edge lists
-    result.c_plus_lines = _build_lines(cp_edges)
-    result.c_minus_lines = _build_lines(cm_edges)
+    # Build line lists from families (filter out single-point families)
+    result.c_minus_lines = [fam for fam in cm_families if len(fam) > 1]
+    result.c_plus_lines = [fam for fam in cp_families if len(fam) > 1]
     result.shock_lines = [t for t in shock_idx_trackers if len(t) > 1]
 
     result.wall_time = time.perf_counter() - t_start
