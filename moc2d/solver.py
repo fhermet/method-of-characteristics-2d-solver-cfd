@@ -146,7 +146,7 @@ def solve(config: SimulationConfig) -> SolverResult:
             p2 = current_layer[i + 1]
             try:
                 p3 = interior_point(p1, p2, gas, geom_type, p0, T0)
-                if p3.x <= p1.x or p3.x <= p2.x:
+                if p3.x <= min(p1.x, p2.x):
                     continue
                 if p3.mach < 1.0:
                     continue
